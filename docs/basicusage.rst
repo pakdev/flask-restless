@@ -120,6 +120,14 @@ Note that you can specify which HTTP methods are available for each API
 endpoint. There are several more customization options; for more information,
 see :ref:`customizing`.
 
+If your model has more than one primary key (one called ``id`` and one called
+``username``, for example), you should specify the one to use::
+
+    manager.create_api(User, primary_key='username')
+
+If you do this, Flask-Restless will create URLs like ``/api/user/myusername``
+instead of ``/api/user/137``.
+
 Due to the design of Flask, these APIs must be created before your application
 handles any requests. The return value of :meth:`APIManager.create_api` is the
 blueprint in which the endpoints for the specified database model live. The
