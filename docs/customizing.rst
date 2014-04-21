@@ -98,6 +98,17 @@ method::
 
 Then the API will be exposed at ``/api/people`` instead of ``/api/person``.
 
+Specifying one of many primary keys
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If your model has more than one primary key (one called ``id`` and one called
+``username``, for example), you should specify the one to use::
+
+    manager.create_api(User, primary_key='username')
+
+If you do this, Flask-Restless will create URLs like ``/api/user/myusername``
+instead of ``/api/user/137``.
+
 .. _allowpatchmany:
 
 Enable patching all instances
@@ -372,7 +383,7 @@ and `postprocessors` can be one of the following strings:
   model.
 * ``'PATCH_SINGLE'`` or ``'PUT_SINGLE'`` for requests to patch a single
   instance of the model.
-* ``'PATCH_MANY'`` or ``'PATCH_SINGLE'`` for requests to patch the entire
+* ``'PATCH_MANY'`` or ``'PUT_MANY'`` for requests to patch the entire
   collection of instances of the model.
 * ``'POST'`` for requests to post a new instance of the model.
 * ``'DELETE'`` for requests to delete an instance of the model.
@@ -561,7 +572,7 @@ authentication::
 
     def auth_func(*args, **kw):
         if not current_user.is_authenticated():
-            raise ProcessingException(message='Not authenticated!')
+            raise ProcessingException(description='Not authenticated!', code=401)
 
     app = Flask(__name__)
     api_manager = APIManager(app, session=session,
@@ -597,6 +608,29 @@ filters* to the ``search_params`` keyword argument. For example::
 
     apimanager.create_api(Person, preprocessors=dict(GET_MANY=[preprocessor]))
 
+Custom queries
+--------------
+
+In cases where it is not possible to use preprocessors or postprocessors
+(:ref:`processors`) efficiently, you can provide a custom ``query`` attribute
+to your model instead. The attribute can either be a callable that returns a
+query::
+
+    class Person(Base):
+        __tablename__ = 'person'
+        id = Column(Integer, primary_key=True)
+
+        @classmethod
+        def query(cls):
+            return get_query_for_current_user(cls)
+
+or a SQLAlchemy query expression::
+
+    class Person(Base):
+        __tablename__ = 'person'
+        id = Column(Integer, primary_key=True)
+        query = get_some_query()
+
 .. _authentication:
 
 Requiring authentication for some methods
@@ -611,10 +645,10 @@ If you want certain HTTP methods to require authentication, use preprocessors::
     from flask.ext.login import current_user
     from mymodels import User
 
-    def auth_func(params):
+    def auth_func(*args, **kwargs):
         if not current_user.is_authenticated():
-            raise ProcessingException(message='Not authenticated!')
-        return NO_CHANGE
+            raise ProcessingException(description='Not authenticated!', code=401)
+        return True
 
     app = Flask(__name__)
     api_manager = APIManager(app)

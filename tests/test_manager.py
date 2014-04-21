@@ -22,7 +22,9 @@ else:
 from flask.ext.restless import APIManager
 from flask.ext.restless.helpers import get_columns
 
+from sqlalchemy import Column
 from sqlalchemy import func
+from sqlalchemy import Unicode
 from sqlalchemy.ext.hybrid import hybrid_property
 
 from .helpers import FlaskTestBase
@@ -113,6 +115,29 @@ class TestAPIManager(TestSupport):
         assert len(loads(response.data)['objects']) == 1
         assert loads(response.data)['objects'][0]['id'] == 1
         assert loads(response.data)['objects'][0]['name'] == 'bar'
+
+    def test_multi_pk(self):
+        """Test for specifying a primary key from a set of primary keys to use
+        when registering routes.
+
+        """
+        self.manager.create_api(self.User, methods=['GET', 'POST'],
+                                primary_key='email')
+        data = dict(id=1, email='foo')
+        response = self.app.post('/api/user', data=dumps(data))
+        assert response.status_code == 201
+        data = loads(response.data)
+        assert data['email'] == 'foo'
+
+        response = self.app.get('/api/user/foo')
+        assert response.status_code == 200
+        data = loads(response.data)
+        assert data['email'] == 'foo'
+        assert data['id'] == 1
+
+        # user should not be accessible at this URL
+        response = self.app.get('/api/user/1')
+        assert response.status_code == 404
 
     def test_different_collection_name(self):
         """Tests that providing a different collection name exposes the API at
@@ -452,7 +477,7 @@ class TestAPIManager(TestSupport):
         """
         self.manager.create_api(self.Person, methods=['GET', 'POST'],
                                 max_results_per_page=15)
-        for n in range(100):
+        for n in range(20):
             response = self.app.post('/api/person', data=dumps({}))
             assert 201 == response.status_code
         response = self.app.get('/api/person?results_per_page=20')

@@ -28,19 +28,22 @@ from functools import wraps
 import math
 import warnings
 
-from flask import abort
 from flask import current_app
 from flask import json
 from flask import jsonify as _jsonify
 from flask import request
 from flask.views import MethodView
+from mimerender import FlaskMimeRender
+from sqlalchemy.exc import DataError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm.exc import MultipleResultsFound
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm.query import Query
 from werkzeug.exceptions import HTTPException
 
+from .helpers import count
 from .helpers import evaluate_functions
 from .helpers import get_by
 from .helpers import get_columns
@@ -65,6 +68,14 @@ from .search import search
 #: Format string for creating Link headers in paginated responses.
 LINKTEMPLATE = '<{0}?page={1}&results_per_page={2}>; rel="{3}"'
 
+#: String used internally as a dictionary key for passing header information
+#: from view functions to the :func:`jsonpify` function.
+_HEADERS = '__restless_headers'
+
+#: String used internally as a dictionary key for passing status code
+#: information from view functions to the :func:`jsonpify` function.
+_STATUS = '__restless_status_code'
+
 
 class ProcessingException(HTTPException):
     """Raised when a preprocessor or postprocessor encounters a problem.
@@ -85,6 +96,19 @@ class ProcessingException(HTTPException):
         super(ProcessingException, self).__init__(*args, **kwargs)
         self.code = code
         self.description = description
+
+
+def _is_msie8or9():
+    """Returns ``True`` if and only if the user agent of the client making the
+    request indicates that it is Microsoft Internet Explorer 8 or 9.
+
+    """
+    if request.user_agent is None or request.user_agent.version is None:
+        return False
+    ua = request.user_agent
+    # request.user_agent.version comes as a string, so we have to parse it
+    ua_version = tuple(int(d) for d in ua.version.split('.'))
+    return ua.browser == 'msie' and (8, 0) <= ua_version < (10, 0)
 
 
 def create_link_string(page, last_page, per_page):
@@ -207,24 +231,39 @@ def jsonpify(*args, **kw):
     function specified as a query parameter called ``'callback'`` (or does
     nothing if no such callback function is specified in the request).
 
-    If `headers` is specified, it must be a dictionary specifying headers to
-    set before sending the JSONified response to the client. Headers on the
-    response will be overwritten by headers specified in the `headers`
-    dictionary.
+    If the keyword arguments include the string specified by :data:`_HEADERS`,
+    its value must be a dictionary specifying headers to set before sending the
+    JSONified response to the client. Headers on the response will be
+    overwritten by headers specified in this dictionary.
+
+    If the keyword arguments include the string specified by :data:`_STATUS`,
+    its value must be an integer representing the status code of the response.
+    Otherwise, the status code of the response will be :http:status:`200`.
 
     """
-    headers = kw.pop('headers', None)
-    # FIXME jsonify already sets headers, so we are doing it twice...
+    # HACK In order to make the headers and status code available in the
+    # content of the response, we need to send it from the view function to
+    # this jsonpify function via its keyword arguments. This is a limitation of
+    # the mimerender library: it has no way of making the headers and status
+    # code known to the rendering functions.
+    headers = kw.pop(_HEADERS, {})
+    status_code = kw.pop(_STATUS, 200)
     response = jsonify(*args, **kw)
     callback = request.args.get('callback', False)
     if callback:
         # Reload the data from the constructed JSON string so we can wrap it in
         # a JSONP function.
         data = json.loads(response.data)
-        # Add the headers as metadata to the JSONP response.
+        # Force the 'Content-Type' header to be 'application/javascript'.
+        #
+        # Note that this is different from the mimetype used in Flask for JSON
+        # responses; Flask uses 'application/json'. We use
+        # 'application/javascript' because a JSONP response is valid
+        # Javascript, but not valid JSON.
+        headers['Content-Type'] = 'application/javascript'
+        # Add the headers and status code as metadata to the JSONP response.
         meta = _headers_to_json(headers) if headers is not None else {}
-        # TODO add a jsonpify_status_code function?
-        meta['status'] = 200
+        meta['status'] = status_code
         inner = json.dumps(dict(meta=meta, data=data))
         content = '{0}({1})'.format(callback, inner)
         # Note that this is different from the mimetype used in Flask for JSON
@@ -235,6 +274,7 @@ def jsonpify(*args, **kw):
     # Set the headers on the HTTP response as well.
     if headers:
         set_headers(response, headers)
+    response.status_code = status_code
     return response
 
 
@@ -299,6 +339,17 @@ def _parse_excludes(column_names):
             del relations[column]
     return columns, relations
 
+#: Creates the mimerender object necessary for decorating responses with a
+#: function that automatically formats the dictionary in the appropriate format
+#: based on the ``Accept`` header.
+#:
+#: Technical details: the first pair of parantheses instantiates the
+#: :class:`mimerender.FlaskMimeRender` class. The second pair of parentheses
+#: creates the decorator, so that we can simply use the variable ``mimerender``
+#: as a decorator.
+mimerender = FlaskMimeRender()(default='json', json=jsonpify,
+                               xml=lambda: None)  # TODO fill in xml renderer
+
 
 class ModelView(MethodView):
     """Base class for :class:`flask.MethodView` classes which represent a view
@@ -315,6 +366,9 @@ class ModelView(MethodView):
     query object, depending on how the model has been defined.
 
     """
+
+    #: List of decorators applied to every method of this class.
+    decorators = [mimerender]
 
     def __init__(self, session, model, *args, **kw):
         """Calls the constructor of the superclass and specifies the model for
@@ -358,27 +412,27 @@ class FunctionAPI(ModelView):
 
         """
         if 'q' not in request.args or not request.args.get('q'):
-            return jsonify(message='Empty query parameter'), 400
+            return dict(message='Empty query parameter'), 400
         # if parsing JSON fails, return a 400 error in JSON format
         try:
             data = json.loads(str(request.args.get('q'))) or {}
         except (TypeError, ValueError, OverflowError) as exception:
             current_app.logger.exception(str(exception))
-            return jsonify(message='Unable to decode data'), 400
+            return dict(message='Unable to decode data'), 400
         try:
             result = evaluate_functions(self.session, self.model,
                                         data.get('functions', []))
             if not result:
-                return jsonpify(), 204
-            return jsonpify(result)
+                return {}, 204
+            return result
         except AttributeError as exception:
             current_app.logger.exception(str(exception))
             message = 'No such field "{0}"'.format(exception.field)
-            return jsonify(message=message), 400
+            return dict(message=message), 400
         except OperationalError as exception:
             current_app.logger.exception(str(exception))
             message = 'No such function "{0}"'.format(exception.function)
-            return jsonify(message=message), 400
+            return dict(message=message), 400
 
 
 class API(ModelView):
@@ -390,13 +444,14 @@ class API(ModelView):
     """
 
     #: List of decorators applied to every method of this class.
-    decorators = [catch_processing_exceptions]
+    decorators = ModelView.decorators + [catch_processing_exceptions]
 
     def __init__(self, session, model, exclude_columns=None,
                  include_columns=None, include_methods=None,
                  validation_exceptions=None, results_per_page=10,
                  max_results_per_page=100, post_form_preprocessor=None,
-                 preprocessors=None, postprocessors=None, *args, **kw):
+                 preprocessors=None, postprocessors=None, primary_key=None,
+                 *args, **kw):
         """Instantiates this view with the specified attributes.
 
         `session` is the SQLAlchemy session in which all database transactions
@@ -476,6 +531,15 @@ class API(ModelView):
         other code. For more information on preprocessors and postprocessors,
         see :ref:`processors`.
 
+        `primary_key` is a string specifying the name of the column of `model`
+        to use as the primary key for the purposes of creating URLs. If the
+        `model` has exactly one primary key, there is no need to provide a
+        value for this. If `model` has two or more primary keys, you must
+        specify which one to use.
+
+        .. versionadded:: 0.13.0
+           Added the `primary_key` keyword argument.
+
         .. versionadded:: 0.10.2
            Added the `include_methods` keyword argument.
 
@@ -516,6 +580,7 @@ class API(ModelView):
         self.validation_exceptions = tuple(validation_exceptions or ())
         self.results_per_page = results_per_page
         self.max_results_per_page = max_results_per_page
+        self.primary_key = primary_key
         self.postprocessors = defaultdict(list)
         self.preprocessors = defaultdict(list)
         self.postprocessors.update(upper_keys(postprocessors or {}))
@@ -707,7 +772,7 @@ class API(ModelView):
         self.session.rollback()
         errors = self._extract_error_messages(exception) or \
             'Could not determine specific validation errors'
-        return jsonify(validation_errors=errors), 400
+        return dict(validation_errors=errors), 400
 
     def _extract_error_messages(self, exception):
         """Tries to extract a dictionary mapping field name to validation error
@@ -761,7 +826,8 @@ class API(ModelView):
         """Returns a paginated JSONified response from the specified list of
         model instances.
 
-        `instances` is a list of model instances.
+        `instances` is either a Python list of model instances or a
+        :class:`~sqlalchemy.orm.Query`.
 
         `deep` is the dictionary which defines the depth of submodels to output
         in the JSON format of the model instances in `instances`; it is passed
@@ -779,10 +845,10 @@ class API(ModelView):
            }
 
         """
-        if type(instances) == list:
+        if isinstance(instances, list):
             num_results = len(instances)
         else:
-            num_results = instances.count()
+            num_results = count(self.session, instances)
         results_per_page = self._compute_results_per_page()
         if results_per_page > 0:
             # get the page number (first page is page 1)
@@ -835,9 +901,9 @@ class API(ModelView):
         :http:statuscode:`404`.
 
         """
-        inst = get_by(self.session, self.model, instid)
+        inst = get_by(self.session, self.model, instid, self.primary_key)
         if inst is None:
-            abort(404)
+            return {_STATUS: 404}, 404
         return self._inst_to_dict(inst)
 
     def _search(self):
@@ -912,7 +978,7 @@ class API(ModelView):
             search_params = json.loads(request.args.get('q', '{}'))
         except (TypeError, ValueError, OverflowError) as exception:
             current_app.logger.exception(str(exception))
-            return jsonify(message='Unable to decode data'), 400
+            return dict(message='Unable to decode data'), 400
 
         for preprocessor in self.preprocessors['GET_MANY']:
             preprocessor(search_params=search_params)
@@ -921,12 +987,12 @@ class API(ModelView):
         try:
             result = search(self.session, self.model, search_params)
         except NoResultFound:
-            return jsonify(message='No result found'), 400
+            return dict(message='No result found'), 404
         except MultipleResultsFound:
-            return jsonify(message='Multiple results found'), 400
+            return dict(message='Multiple results found'), 400
         except Exception as exception:
             current_app.logger.exception(str(exception))
-            return jsonify(message='Unable to construct query'), 400
+            return dict(message='Unable to construct query'), 400
 
         # create a placeholder for the relations of the returned models
         relations = frozenset(get_relations(self.model))
@@ -965,7 +1031,11 @@ class API(ModelView):
         for postprocessor in self.postprocessors['GET_MANY']:
             postprocessor(result=result, search_params=search_params)
 
-        return jsonpify(result, headers=headers)
+        # HACK Provide the headers directly in the result dictionary, so that
+        # the :func:`jsonpify` function has access to them. See the note there
+        # for more information.
+        result[_HEADERS] = headers
+        return result, 200, headers
 
     def get(self, instid, relationname, relationinstid):
         """Returns a JSON representation of an instance of model with the
@@ -986,9 +1056,9 @@ class API(ModelView):
         for preprocessor in self.preprocessors['GET_SINGLE']:
             preprocessor(instance_id=instid)
         # get the instance of the "main" model whose ID is instid
-        instance = get_by(self.session, self.model, instid)
+        instance = get_by(self.session, self.model, instid, self.primary_key)
         if instance is None:
-            abort(404)
+            return {_STATUS: 404}, 404
         # If no relation is requested, just return the instance. Otherwise,
         # get the value of the relation specified by `relationname`.
         if relationname is None:
@@ -1003,7 +1073,7 @@ class API(ModelView):
                 related_value_instance = get_by(self.session, related_model,
                                                 relationinstid)
                 if related_value_instance is None:
-                    abort(404)
+                    return {_STATUS: 404}, 404
                 result = to_dict(related_value_instance, deep)
             else:
                 # for security purposes, don't transmit list as top-level JSON
@@ -1011,9 +1081,11 @@ class API(ModelView):
                     result = self._paginated(list(related_value), deep)
                 else:
                     result = to_dict(related_value, deep)
+        if result is None:
+            return {_STATUS: 404}, 404
         for postprocessor in self.postprocessors['GET_SINGLE']:
             postprocessor(result=result)
-        return jsonpify(result)
+        return result
 
     def delete(self, instid, relationname, relationinstid):
         """Removes the specified instance of the model with the specified name
@@ -1036,13 +1108,13 @@ class API(ModelView):
         for preprocessor in self.preprocessors['DELETE']:
             preprocessor(instance_id=instid, relation_name=relationname,
                          relation_instance_id=relationinstid)
-        inst = get_by(self.session, self.model, instid)
+        inst = get_by(self.session, self.model, instid, self.primary_key)
         if relationname:
             # If the request is ``DELETE /api/person/1/computers``, error 400.
             if not relationinstid:
                 msg = ('Cannot DELETE entire "{0}"'
                        ' relation').format(relationname)
-                return jsonify(message=msg), 400
+                return dict(message=msg), 400
             # Otherwise, get the related instance to delete.
             relation = getattr(inst, relationname)
             related_model = get_related_model(self.model, relationname)
@@ -1056,7 +1128,7 @@ class API(ModelView):
             is_deleted = True
         for postprocessor in self.postprocessors['DELETE']:
             postprocessor(is_deleted=is_deleted)
-        return jsonify(), 204
+        return {}, 204
 
     def post(self):
         """Creates a new instance of a given model based on request data.
@@ -1079,16 +1151,27 @@ class API(ModelView):
 
         """
         content_type = request.headers.get('Content-Type', None)
-        if not content_type.startswith('application/json'):
+        content_is_json = content_type.startswith('application/json')
+        is_msie = _is_msie8or9()
+        # Request must have the Content-Type: application/json header, unless
+        # the User-Agent string indicates that the client is Microsoft Internet
+        # Explorer 8 or 9 (which has a fixed Content-Type of 'text/html'; see
+        # issue #267).
+        if not is_msie and not content_is_json:
             msg = 'Request must have "Content-Type: application/json" header'
-            return jsonify(message=msg), 415
+            return dict(message=msg), 415
 
         # try to read the parameters for the model from the body of the request
         try:
-            params = request.get_json() or {}
-        except BadRequest as exception:
+            # HACK Requests made from Internet Explorer 8 or 9 don't have the
+            # correct content type, so request.get_json() doesn't work.
+            if is_msie:
+                params = json.loads(request.get_data()) or {}
+            else:
+                params = request.get_json() or {}
+        except (BadRequest, TypeError, ValueError, OverflowError) as exception:
             current_app.logger.exception(str(exception))
-            return jsonify(message='Unable to decode data'), 400
+            return dict(message='Unable to decode data'), 400
 
         # apply any preprocessors to the POST arguments
         for preprocessor in self.preprocessors['POST']:
@@ -1099,7 +1182,7 @@ class API(ModelView):
         for field in params:
             if not has_field(self.model, field):
                 msg = "Model does not have field '{0}'".format(field)
-                return jsonify(message=msg), 400
+                return dict(message=msg), 400
 
         # Getting the list of relations that will be added later
         cols = get_columns(self.model)
@@ -1128,7 +1211,11 @@ class API(ModelView):
                     for subparams in params[col]:
                         subinst = get_or_create(self.session, submodel,
                                                 subparams)
-                        getattr(instance, col).append(subinst)
+                        try:
+                            getattr(instance, col).append(subinst)
+                        except AttributeError:
+                            attribute = getattr(instance, col)
+                            attribute[subinst.key] = subinst.value
                 else:
                     # model has single related object
                     subinst = get_or_create(self.session, submodel,
@@ -1139,6 +1226,7 @@ class API(ModelView):
             self.session.add(instance)
             self.session.commit()
             result = self._inst_to_dict(instance)
+
             primary_key = str(result[primary_key_name(instance)])
 
             # The URL at which a client can access the newly created instance
@@ -1151,12 +1239,13 @@ class API(ModelView):
             for postprocessor in self.postprocessors['POST']:
                 postprocessor(result=result)
 
-            return jsonify(headers=headers, **result), 201
+            return result, 201, headers
         except self.validation_exceptions as exception:
             return self._handle_validation_exception(exception)
-        except IntegrityError as exception:
+        except (DataError, IntegrityError, ProgrammingError) as exception:
+            self.session.rollback()
             current_app.logger.exception(str(exception))
-            return jsonify(message=str(exception)), 400
+            return dict(message=str(exception)), 400
 
     def patch(self, instid, relationname, relationinstid):
         """Updates the instance specified by ``instid`` of the named model, or
@@ -1184,19 +1273,30 @@ class API(ModelView):
 
         """
         content_type = request.headers.get('Content-Type', None)
-        if not content_type.startswith('application/json'):
+        content_is_json = content_type.startswith('application/json')
+        is_msie = _is_msie8or9()
+        # Request must have the Content-Type: application/json header, unless
+        # the User-Agent string indicates that the client is Microsoft Internet
+        # Explorer 8 or 9 (which has a fixed Content-Type of 'text/html'; see
+        # issue #267).
+        if not is_msie and not content_is_json:
             msg = 'Request must have "Content-Type: application/json" header'
-            return jsonify(message=msg), 415
+            return dict(message=msg), 415
 
         # try to load the fields/values to update from the body of the request
         try:
-            data = request.get_json() or {}
-        except BadRequest as exception:
+            # HACK Requests made from Internet Explorer 8 or 9 don't have the
+            # correct content type, so request.get_json() doesn't work.
+            if is_msie:
+                data = json.loads(request.get_data()) or {}
+            else:
+                data = request.get_json() or {}
+        except (BadRequest, TypeError, ValueError, OverflowError) as exception:
             # this also happens when request.data is empty
             current_app.logger.exception(str(exception))
-            return jsonify(message='Unable to decode data'), 400
-        # Check if the request is to patch many instances of the current model.
+            return dict(message='Unable to decode data'), 400
 
+        # Check if the request is to patch many instances of the current model.
         patchmany = instid is None
         # Perform any necessary preprocessing.
         if patchmany:
@@ -1214,19 +1314,20 @@ class API(ModelView):
         for field in data:
             if not has_field(self.model, field):
                 msg = "Model does not have field '{0}'".format(field)
-                return jsonify(message=msg), 400
+                return dict(message=msg), 400
+
         if patchmany:
             try:
                 # create a SQLALchemy Query from the query parameter `q`
                 query = create_query(self.session, self.model, search_params)
             except Exception as exception:
                 current_app.logger.exception(str(exception))
-                return jsonify(message='Unable to construct query'), 400
+                return dict(message='Unable to construct query'), 400
         else:
             # create a SQLAlchemy Query which has exactly the specified row
             query = query_by_primary_key(self.session, self.model, instid)
             if query.count() == 0:
-                abort(404)
+                return {_STATUS: 404}, 404
             assert query.count() == 1, 'Multiple rows with same ID'
 
         relations = self._update_relations(query, data)
@@ -1249,9 +1350,9 @@ class API(ModelView):
         except self.validation_exceptions as exception:
             current_app.logger.exception(str(exception))
             return self._handle_validation_exception(exception)
-        except IntegrityError as exception:
+        except (DataError, IntegrityError, ProgrammingError) as exception:
             current_app.logger.exception(str(exception))
-            return jsonify(message=str(exception)), 400
+            return dict(message=str(exception)), 400
 
         # Perform any necessary postprocessing.
         if patchmany:
@@ -1264,7 +1365,7 @@ class API(ModelView):
             for postprocessor in self.postprocessors['PATCH_SINGLE']:
                 postprocessor(result=result)
 
-        return jsonify(result)
+        return result
 
     def put(self, *args, **kw):
         """Alias for :meth:`patch`."""

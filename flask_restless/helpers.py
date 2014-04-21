@@ -15,20 +15,21 @@ import uuid
 from dateutil.parser import parse as parse_datetime
 from sqlalchemy import Date
 from sqlalchemy import DateTime
+from sqlalchemy import Interval
+from sqlalchemy.exc import NoInspectionAvailable
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.associationproxy import AssociationProxy
+from sqlalchemy.ext import hybrid
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import ColumnProperty
-from sqlalchemy.orm import object_mapper
 from sqlalchemy.orm import RelationshipProperty as RelProperty
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.orm.attributes import QueryableAttribute
-from sqlalchemy.orm.exc import UnmappedInstanceError
 from sqlalchemy.orm.query import Query
-from sqlalchemy.orm.util import class_mapper
 from sqlalchemy.sql import func
 from sqlalchemy.sql.expression import _BinaryExpression
 from sqlalchemy.sql.expression import ColumnElement
+from sqlalchemy.inspection import inspect as sqlalchemy_inspect
 
 #: Names of attributes which should definitely not be considered relations when
 #: dynamically computing a list of relations of a SQLAlchemy model.
@@ -65,11 +66,19 @@ def partition(l, condition):
 def session_query(session, model):
     """Returns a SQLAlchemy query object for the specified `model`.
 
-    If `model` has a ``query`` attribute already, that object will be returned.
-    Otherwise a query will be created and returned based on `session`.
+    If `model` has a ``query`` attribute already, ``model.query`` will be
+    returned. If the ``query`` attribute is callable ``model.query()`` will be
+    returned instead.
+
+    If `model` has no such attribute, a query based on `session` will be
+    created and returned.
 
     """
-    return model.query if hasattr(model, 'query') else session.query(model)
+    if hasattr(model, 'query'):
+        if callable(model.query):
+            return model.query()
+        return model.query
+    return session.query(model)
 
 
 def upper_keys(d):
@@ -141,11 +150,8 @@ def has_field(model, fieldname):
             not isinstance(getattr(model, fieldname), _BinaryExpression))
 
 
-def is_date_field(model, fieldname):
-    """Returns ``True`` if and only if the field of `model` with the specified
-    name corresponds to either a :class:`datetime.date` object or a
-    :class:`datetime.datetime` object.
-
+def get_field_type(model, fieldname):
+    """Helper which returns the SQLAlchemy type of the field.
     """
     field = getattr(model, fieldname)
     if isinstance(field, ColumnElement):
@@ -156,11 +162,28 @@ def is_date_field(model, fieldname):
         if hasattr(field, 'property'):
             prop = field.property
             if isinstance(prop, RelProperty):
-                return False
+                return None
             fieldtype = prop.columns[0].type
         else:
-            return False
+            return None
+    return fieldtype
+
+
+def is_date_field(model, fieldname):
+    """Returns ``True`` if and only if the field of `model` with the specified
+    name corresponds to either a :class:`datetime.date` object or a
+    :class:`datetime.datetime` object.
+    """
+    fieldtype = get_field_type(model, fieldname)
     return isinstance(fieldtype, Date) or isinstance(fieldtype, DateTime)
+
+
+def is_interval_field(model, fieldname):
+    """Returns ``True`` if and only if the field of `model` with the specified
+    name corresponds to a :class:`datetime.timedelta` object.
+    """
+    fieldtype = get_field_type(model, fieldname)
+    return isinstance(fieldtype, Interval)
 
 
 def assign_attributes(model, **kwargs):
@@ -212,12 +235,16 @@ def is_like_list(instance, relation):
     if relation in instance._sa_class_manager:
         return instance._sa_class_manager[relation].property.uselist
     related_value = getattr(type(instance), relation, None)
-    return isinstance(related_value, AssociationProxy)
+    if isinstance(related_value, AssociationProxy):
+        local_prop = related_value.local_attr.prop
+        if isinstance(local_prop, RelProperty):
+            return local_prop.uselist
+    return False
 
 
 def is_mapped_class(cls):
     try:
-        class_mapper(cls)
+        sqlalchemy_inspect(cls)
         return True
     except:
         return False
@@ -271,14 +298,17 @@ def to_dict(instance, deep=None, exclude=None, include=None,
             (include is not None or include_relations is not None):
         raise ValueError('Cannot specify both include and exclude.')
     # create a list of names of columns, including hybrid properties
+    instance_type = type(instance)
+    columns = []
     try:
-        columns = [p.key for p in object_mapper(instance).iterate_properties
-                   if isinstance(p, ColumnProperty)]
-    except UnmappedInstanceError:
+        inspected_instance = sqlalchemy_inspect(instance_type)
+        column_attrs = inspected_instance.column_attrs.keys()
+        descriptors = inspected_instance.all_orm_descriptors.items()
+        hybrid_columns = [k for k, d in descriptors
+                          if d.extension_type == hybrid.HYBRID_PROPERTY]
+        columns = column_attrs + hybrid_columns
+    except NoInspectionAvailable:
         return instance
-    for parent in type(instance).mro():
-        columns += [key for key, value in parent.__dict__.items()
-                    if isinstance(value, hybrid_property)]
     # filter the columns based on exclude and include values
     if exclude is not None:
         columns = (c for c in columns if c not in exclude)
@@ -297,15 +327,14 @@ def to_dict(instance, deep=None, exclude=None, include=None,
                            for method in include_methods
                            if not '.' in method))
     # Check for objects in the dictionary that may not be serializable by
-    # default. Specifically, convert datetime and date objects to ISO 8601
-    # format, and convert UUID objects to hexadecimal strings.
+    # default. Convert datetime objects to ISO 8601 format, convert UUID
+    # objects to hexadecimal strings, etc.
     for key, value in result.items():
-        # TODO We can get rid of this when issue #33 is resolved.
-        if isinstance(value, datetime.date):
+        if isinstance(value, (datetime.date, datetime.time)):
             result[key] = value.isoformat()
         elif isinstance(value, uuid.UUID):
             result[key] = str(value)
-        elif is_mapped_class(type(value)):
+        elif key not in column_attrs and is_mapped_class(type(value)):
             result[key] = to_dict(value)
     # recursively call _to_dict on each of the `deep` relations
     deep = deep or {}
@@ -420,25 +449,32 @@ def evaluate_functions(session, model, functions):
     return dict(zip(funcnames, evaluated))
 
 
-def query_by_primary_key(session, model, primary_key_value):
+def query_by_primary_key(session, model, primary_key_value, primary_key=None):
     """Returns a SQLAlchemy query object containing the result of querying
     `model` for instances whose primary key has the value `primary_key_value`.
+
+    If `primary_key` is specified, the column specified by that string is used
+    as the primary key column. Otherwise, the column named ``id`` is used.
 
     Presumably, the returned query should have at most one element.
 
     """
-    # force unicode primary key name to string; see unicode_keys_to_strings
-    pk_name = str(primary_key_name(model))
+    pk_name = primary_key or primary_key_name(model)
     query = session_query(session, model)
-    return query.filter_by(**{pk_name: primary_key_value})
+    return query.filter(getattr(model, pk_name) == primary_key_value)
 
 
-def get_by(session, model, primary_key_value):
+def get_by(session, model, primary_key_value, primary_key=None):
     """Returns the first instance of `model` whose primary key has the value
     `primary_key_value`, or ``None`` if no such instance exists.
 
+    If `primary_key` is specified, the column specified by that string is used
+    as the primary key column. Otherwise, the column named ``id`` is used.
+
     """
-    return query_by_primary_key(session, model, primary_key_value).first()
+    result = query_by_primary_key(session, model, primary_key_value,
+                                  primary_key)
+    return result.first()
 
 
 def get_or_create(session, model, attrs):
@@ -490,15 +526,16 @@ def get_or_create(session, model, attrs):
 
 def strings_to_dates(model, dictionary):
     """Returns a new dictionary with all the mappings of `dictionary` but
-    with date strings mapped to :class:`datetime.datetime` objects.
+    with date strings and intervals mapped to :class:`datetime.datetime` or
+    :class:`datetime.timedelta` objects.
 
     The keys of `dictionary` are names of fields in the model specified in the
     constructor of this class. The values are values to set on these fields. If
     a field name corresponds to a field in the model which is a
-    :class:`sqlalchemy.types.Date` or :class:`sqlalchemy.types.DateTime`, then
-    the returned dictionary will have the corresponding
-    :class:`datetime.datetime` Python object as the value of that mapping in
-    place of the string.
+    :class:`sqlalchemy.types.Date`, :class:`sqlalchemy.types.DateTime`, or
+    :class:`sqlalchemy.Interval`, then the returned dictionary will have the
+    corresponding :class:`datetime.datetime` or :class:`datetime.timedelta`
+    Python object as the value of that mapping in place of the string.
 
     This function outputs a new dictionary; it does not modify the argument.
 
@@ -512,6 +549,22 @@ def strings_to_dates(model, dictionary):
                 result[fieldname] = getattr(func, value.lower())()
             else:
                 result[fieldname] = parse_datetime(value)
+        elif (is_interval_field(model, fieldname) and value is not None
+              and isinstance(value, int)):
+            result[fieldname] = datetime.timedelta(seconds=value)
         else:
             result[fieldname] = value
     return result
+
+
+def count(session, query):
+    """Returns the count of the specified `query`.
+
+    This function employs an optimization that bypasses the
+    :meth:`sqlalchemy.orm.Query.count` method, which can be very slow for large
+    queries.
+
+    """
+    counts = query.statement.with_only_columns([func.count()])
+    num_results = session.execute(counts.order_by(None)).scalar()
+    return query.count() if num_results is None else num_results

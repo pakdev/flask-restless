@@ -19,7 +19,8 @@ from setuptools import setup
 
 #: The installation requirements for Flask-Restless. Flask-SQLAlchemy is not
 #: required, so the user must install it explicitly.
-requirements = ['flask>=0.10', 'sqlalchemy', 'python-dateutil>2.0']
+requirements = ['flask>=0.10', 'sqlalchemy>=0.8', 'python-dateutil>2.0',
+                'mimerender>=0.5.2']
 
 
 setup(
@@ -50,6 +51,6 @@ setup(
     test_suite='nose.collector',
     tests_require=['nose'],
     url='http://github.com/jfinkels/flask-restless',
-    version='0.13.0-dev',
+    version='0.14.0-dev',
     zip_safe=False
 )
