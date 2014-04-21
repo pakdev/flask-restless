@@ -289,7 +289,11 @@ def to_dict(instance, deep=None, exclude=None, include=None,
                   if not (col.startswith('__') or col in COLUMN_BLACKLIST))
     # add any included methods
     if include_methods is not None:
-        result.update(dict((method, getattr(instance, method)())
+        def get_value(method):
+            attr = getattr(type(instance), method)
+            return attr.fget(instance) if isinstance(attr, property) else attr(instance)
+
+        result.update(dict((method, get_value(method))
                            for method in include_methods
                            if not '.' in method))
     # Check for objects in the dictionary that may not be serializable by
