@@ -994,16 +994,30 @@ class API(ModelView):
             current_app.logger.exception(str(exception))
             return dict(message='Unable to construct query'), 400
 
-        # create a placeholder for the relations of the returned models
-        relations = frozenset(get_relations(self.model))
-        # do not follow relations that will not be included in the response
-        if self.include_columns is not None:
-            cols = frozenset(self.include_columns)
-            rels = frozenset(self.include_relations)
-            relations &= (cols | rels)
-        elif self.exclude_columns is not None:
-            relations -= frozenset(self.exclude_columns)
-        deep = dict((r, {}) for r in relations)
+        def get_depth(model, paths):
+            # create a placeholder for the relations of the returned models
+            relations = frozenset(get_relations(model))
+            # do not follow relations that will not be included in the response
+            if self.include_columns is not None:
+                cols = frozenset(self.include_columns)
+                rels = frozenset(self.include_relations)
+                relations &= (cols | rels)
+            elif self.exclude_columns is not None:
+                relations -= frozenset(self.exclude_columns)
+            for path in paths:
+                if '.' in path:
+                    current, rest = path.split('.', 1)
+                    if current in relations:
+                        return {current: get_depth(get_related_model(model, current), [rest])}
+                elif path in relations:
+                    return {path: {}}
+            return dict((r, {}) for r in relations)
+
+        query_paths = []
+        query_relations = request.args.get('query_relations', None)
+        if query_relations:
+            query_paths = json.loads(query_relations)
+        deep = get_depth(self.model, query_paths)
 
         # for security purposes, don't transmit list as top-level JSON
         if isinstance(result, Query):
